@@ -1,0 +1,241 @@
+---
+- name: Configure EC2 server and deploy Node.js application
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /opt/app
+    app_user: ubuntu
+    node_version: "20"
+    # These are passed via --extra-vars from the CI workflow
+    rds_endpoint: "{{ rds_endpoint }}"
+    db_username: "{{ db_username }}"
+    db_password: "{{ db_password }}"
+    db_name: "{{ db_name }}"
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # System packages
+    # -------------------------------------------------------------------------
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - git
+          - curl
+          - nginx
+          - python3
+          - python3-pip
+          - build-essential
+        state: present
+
+    # -------------------------------------------------------------------------
+    # Node.js 20 via NodeSource
+    # -------------------------------------------------------------------------
+    - name: Check if NodeSource setup script already run
+      stat:
+        path: /etc/apt/sources.list.d/nodesource.list
+      register: nodesource_list
+
+    - name: Download NodeSource setup script
+      get_url:
+        url: "https://deb.nodesource.com/setup_{{ node_version }}.x"
+        dest: /tmp/nodesource_setup.sh
+        mode: "0755"
+      when: not nodesource_list.stat.exists
+
+    - name: Run NodeSource setup script
+      command: bash /tmp/nodesource_setup.sh
+      when: not nodesource_list.stat.exists
+
+    - name: Install Node.js
+      apt:
+        name: nodejs
+        state: present
+        update_cache: yes
+
+    - name: Verify Node.js version
+      command: node --version
+      register: node_ver
+      changed_when: false
+
+    - name: Print Node.js version
+      debug:
+        msg: "Node.js version: {{ node_ver.stdout }}"
+
+    # -------------------------------------------------------------------------
+    # PM2
+    # -------------------------------------------------------------------------
+    - name: Install PM2 globally
+      npm:
+        name: pm2
+        global: yes
+        state: present
+
+    - name: Setup PM2 startup script
+      command: pm2 startup systemd -u {{ app_user }} --hp /home/{{ app_user }}
+      args:
+        creates: /etc/systemd/system/pm2-{{ app_user }}.service
+
+    # -------------------------------------------------------------------------
+    # Application directory
+    # -------------------------------------------------------------------------
+    - name: Ensure app directory exists
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    - name: Sync application code from checkout
+      synchronize:
+        src: "{{ playbook_dir }}/../"
+        dest: "{{ app_dir }}/"
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=node_modules"
+          - "--exclude=.github"
+          - "--exclude=terraform"
+          - "--exclude=ansible"
+          - "--exclude='*.log'"
+        delete: yes
+      become: false
+
+    - name: Fix app directory ownership
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: yes
+
+    # -------------------------------------------------------------------------
+    # .env file - rendered via shell (never copy:) so empty values are safe
+    # HOST=127.0.0.1 ensures the app binds only to loopback, not 0.0.0.0
+    # -------------------------------------------------------------------------
+    - name: Render .env file on EC2
+      shell: |
+        cat > {{ app_dir }}/.env << 'ENVEOF'
+        DATABASE_URL=postgresql://{{ db_username }}:{{ db_password }}@{{ rds_endpoint }}:5432/{{ db_name }}
+        DB_SSL=true
+        PORT=3000
+        HOST=127.0.0.1
+        NODE_ENV=production
+        ENVEOF
+        chown {{ app_user }}:{{ app_user }} {{ app_dir }}/.env
+        chmod 600 {{ app_dir }}/.env
+      no_log: true
+
+    # -------------------------------------------------------------------------
+    # npm install
+    # -------------------------------------------------------------------------
+    - name: Install npm dependencies
+      npm:
+        path: "{{ app_dir }}"
+        state: present
+        production: yes
+      become_user: "{{ app_user }}"
+
+    # -------------------------------------------------------------------------
+    # PM2 - start / reload application
+    # The start command is exactly: pm2 start npm --name app -- start --update-env
+    # -------------------------------------------------------------------------
+    - name: Check if PM2 app is already running
+      command: pm2 describe app
+      register: pm2_describe
+      failed_when: false
+      changed_when: false
+      become_user: "{{ app_user }}"
+
+    - name: Stop existing PM2 app if running
+      command: pm2 delete app
+      when: pm2_describe.rc == 0
+      become_user: "{{ app_user }}"
+      failed_when: false
+
+    - name: Start application with PM2
+      shell: |
+        cd {{ app_dir }}
+        pm2 start npm --name app -- start --update-env
+      become_user: "{{ app_user }}"
+      environment:
+        HOME: /home/{{ app_user }}
+
+    - name: Save PM2 process list
+      command: pm2 save
+      become_user: "{{ app_user }}"
+      environment:
+        HOME: /home/{{ app_user }}
+
+    # -------------------------------------------------------------------------
+    # Nginx - reverse proxy port 80 -> 127.0.0.1:3000
+    # -------------------------------------------------------------------------
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Write Nginx site config
+      shell: |
+        cat > /etc/nginx/sites-available/app << 'NGINXEOF'
+        server {
+            listen 80 default_server;
+            listen [::]:80 default_server;
+
+            server_name _;
+
+            access_log /var/log/nginx/app_access.log;
+            error_log  /var/log/nginx/app_error.log;
+
+            location / {
+                proxy_pass         http://127.0.0.1:3000;
+                proxy_http_version 1.1;
+                proxy_set_header   Upgrade           $http_upgrade;
+                proxy_set_header   Connection        'upgrade';
+                proxy_set_header   Host              $host;
+                proxy_set_header   X-Real-IP         $remote_addr;
+                proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+                proxy_set_header   X-Forwarded-Proto $scheme;
+                proxy_cache_bypass $http_upgrade;
+                proxy_read_timeout 60s;
+            }
+        }
+        NGINXEOF
+
+    - name: Enable Nginx app site
+      file:
+        src: /etc/nginx/sites-available/app
+        dest: /etc/nginx/sites-enabled/app
+        state: link
+
+    - name: Test Nginx configuration
+      command: nginx -t
+      changed_when: false
+
+    - name: Restart and enable Nginx
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    # -------------------------------------------------------------------------
+    # Health check - confirm app is responding locally before CI smoke test
+    # -------------------------------------------------------------------------
+    - name: Wait for app to respond on localhost:3000
+      uri:
+        url: "http://127.0.0.1:3000/health"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: health_check
+      retries: 12
+      delay: 10
+      until: health_check.status == 200
